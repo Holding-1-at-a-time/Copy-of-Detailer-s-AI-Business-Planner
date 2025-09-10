@@ -1,10 +1,12 @@
 import { v } from "convex/values";
 import { Agent } from "@convex-dev/agent";
 import { openai } from "@convex-dev/openai";
-import { components, internal } from "./_generated/api";
-import { internalAction } from "./_generated/server";
+import { ActionCache } from "@convex-dev/action-cache";
+import { components, internal, api } from "./_generated/api";
+import { internalAction, internalQuery, action } from "./_generated/server";
 import { assertHasFeature, assertHasOrgAccess } from "./auth";
 import { Doc, Id } from "./_generated/dataModel";
+import { ConvexError } from "convex/values";
 
 const systemPrompt = `
 You are a world-class business consultant specializing in the car detailing industry. Your analysis must be sharp, proactive, and data-driven. Your primary goal is to help the user increase profitability and efficiency.
@@ -31,7 +33,7 @@ const summarizeJobs = (jobs: any[]): string => {
 
 // Helper to get all business context for an organization
 const getBusinessContext = async (ctx: any, orgId: Id<"organizations">) => {
-    const data = await ctx.runQuery(internal.ai.getAiContext, { orgId });
+    const data = await ctx.runQuery(internal.agent.getAiContext, { orgId });
     const { analytics, goals, jobs } = data;
 
     const formattedGoals = goals.filter(g => g.status === 'active').map(g => `- Goal: ${g.description} (Target: ${g.targetValue}, Current: ${g.currentValue})`).join('\n');
@@ -44,7 +46,8 @@ export const agent = new Agent(components.agent, {
   name: "Business Consultant",
   instructions: systemPrompt,
   chat: openai.chat("gpt-4o-mini"),
-  serverUrl: process.env.CONVEX_SITE_URL,
+  // FIX: Removed invalid `serverUrl` property from the Agent configuration.
+  // serverUrl: process.env.CONVEX_SITE_URL,
   // Augment every message with the latest business data.
   async context(ctx, { thread }) {
     const { orgId } = await ctx.runQuery(internal.agent.getThreadOrg, { threadId: thread._id });
@@ -79,11 +82,39 @@ export const getThreadOrg = internal.query({
     },
 });
 
-// Re-implement generatePlan as a public action that uses the new agent backend
-export const generatePlan = internalAction({
+// Internal query to get all data needed for AI context.
+export const getAiContext = internal.query({
+    args: { orgId: v.id("organizations") },
+    handler: async (ctx, { orgId }) => {
+        await assertHasOrgAccess(ctx, orgId);
+        const goals = await ctx.db.query("goals").withIndex("by_orgId", q => q.eq("orgId", orgId)).collect();
+        const jobs = await ctx.db.query("jobs").withIndex("by_orgId", q => q.eq("orgId", orgId)).collect();
+        const analytics = await ctx.db.query("analytics").withIndex("by_orgId", q => q.eq("orgId", orgId)).collect();
+        return { goals, jobs, analytics };
+    }
+});
+
+export const getPlanGenerationContext = internal.query({
     args: { goalId: v.id("goals") },
     handler: async (ctx, { goalId }) => {
-        const context = await ctx.runQuery(internal.ai.getPlanGenerationContext, { goalId });
+        const goal = await ctx.db.get(goalId);
+        if (!goal) {
+            throw new ConvexError("Goal not found");
+        }
+        await assertHasOrgAccess(ctx, goal.orgId);
+
+        const allGoals = await ctx.db.query("goals").withIndex("by_orgId", q => q.eq("orgId", goal.orgId)).collect();
+        const jobs = await ctx.db.query("jobs").withIndex("by_orgId", q => q.eq("orgId", goal.orgId)).collect();
+
+        return { goal, allGoals, jobs };
+    }
+});
+
+// Internal action to run the expensive AI call for plan generation.
+export const runGeneratePlan = internalAction({
+    args: { goalId: v.id("goals") },
+    handler: async (ctx, { goalId }) => {
+        const context = await ctx.runQuery(internal.agent.getPlanGenerationContext, { goalId });
         const { goal, allGoals, jobs } = context;
 
         const jobSummary = summarizeJobs(jobs);
@@ -110,8 +141,30 @@ export const generatePlan = internalAction({
     },
 });
 
+// Configure the cache for the plan generation action.
+const planCache = new ActionCache(components.actionCache, {
+  name: "aiActionPlans_v1",
+  ttl: 24 * 60 * 60 * 1000, // 24 hours
+  action: internal.agent.runGeneratePlan,
+});
+
+// Public action for generating an action plan, now with caching.
+export const generatePlan = action({
+    args: { goalId: v.id("goals") },
+    handler: async (ctx, args) => {
+        const goal = await ctx.runQuery(api.goals.get, { id: args.goalId });
+        if (!goal) {
+            throw new ConvexError("Goal not found");
+        }
+        await assertHasFeature(ctx, goal.orgId, "ai_action_plans");
+        
+        return await planCache.fetch(ctx, args);
+    }
+});
+
 // Re-implement suggest as a public action
-export const suggest = agent.action({
+// FIX: Changed `agent.action` to `action` as the `action` method no longer exists on the `Agent` class.
+export const suggest = action({
     args: { threadId: v.id("threads") },
     handler: async (ctx, { threadId }) => {
         await assertHasOrgAccess(ctx, (await ctx.runQuery(internal.agent.getThreadOrg, { threadId })).orgId);
